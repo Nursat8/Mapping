@@ -1,91 +1,91 @@
+#!/usr/bin/env python3
 import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-st.title("EquityRef ESG Data Mapper")
+def main():
+    st.set_page_config(page_title="EquityRef ESG Data Mapper", layout="wide")
+    st.title("EquityRef ESG Data Mapper")
 
-# Upload inputs
-equity_file = st.file_uploader("Upload EquityRef_ESGdataMap file", type=["xlsx", "xls"])  
-taxonomy_files = st.file_uploader(
-    "Upload Taxonomy mapping files (FMP & NFC)", 
-    type=["xlsx", "xls"], 
-    accept_multiple_files=True
-)
-pai_file = st.file_uploader(
-    "Upload PAI mapping file (SFDR_Corporate_CPUPU_LYr_202503)", 
-    type=["xlsx", "xls"]
-)
-esg_file = st.file_uploader(
-    "Upload ESG mapping file (SPGlobal_Export_4-11-2025_97777e98-3cf6-4636-9833-ceca80a4f6c6)", 
-    type=["xlsx", "xls"]
-)
+    # 1) Upload input files
+    equity_file = st.file_uploader("Upload EquityRef_ESGdataMap (main file)", type=["xlsx", "xls"])
+    taxonomy_files = st.file_uploader("Upload Taxonomy mapping files (2x)", type=["xlsx", "xls"], accept_multiple_files=True)
+    pai_file = st.file_uploader("Upload PAI mapping file (SFDR_Corporate_CPUPU_LYr_202503)", type=["xlsx", "xls"])
+    esg_file = st.file_uploader("Upload ESG mapping file (SPGlobal_Export_4-11-2025 file)", type=["xlsx", "xls"])
 
-if st.button("Process & Fill Columns"):
-    # Check all files provided
-    if not equity_file or len(taxonomy_files) < 2 or not pai_file or not esg_file:
-        st.error("Please upload the main file, both taxonomy files, the PAI file, and the ESG file.")
-    else:
+    if st.button("Process & Fill Columns"):
+        if not equity_file or len(taxonomy_files) < 2 or not pai_file or not esg_file:
+            st.error("Please upload: main file, both taxonomy files, PAI file, and ESG file.")
+            return
+
         # Read main DataFrame
         df_main = pd.read_excel(equity_file)
-        
-        # Define column names
-        id_col = 'Ids'
+        id_col = 'Ids'       # column G
         taxonomy_col = 'Taxonomy'
         pai_col = 'PAI'
         esg_col = 'ESG'
-        
-        # Ensure ID column exists
+
+        # Validate ID column in main
         if id_col not in df_main.columns:
             st.error(f"Column '{id_col}' not found in main file.")
-        else:
-            # Read mapping DataFrames
-            tax_dfs = []
-            for f in taxonomy_files:
-                try:
-                    tax_dfs.append(pd.read_excel(f))
-                except Exception as e:
-                    st.error(f"Failed to read taxonomy file: {e}")
+            return
 
-            df_pai_map = pd.read_excel(pai_file)
-            df_esg_map = pd.read_excel(esg_file)
+        # Initialize output columns if missing
+        for col in [taxonomy_col, pai_col, esg_col]:
+            if col not in df_main.columns:
+                df_main[col] = ""
 
-            # Initialize output columns if missing
-            for col in [taxonomy_col, pai_col, esg_col]:
-                if col not in df_main.columns:
-                    df_main[col] = ''
+        # --- Taxonomy mapping ---
+        taxonomy_ids = set()
+        for f in taxonomy_files:
+            try:
+                # Read only the MI Key column
+                df_tax = pd.read_excel(f, usecols=['MI Key'])
+                taxonomy_ids.update(df_tax['MI Key'].dropna().astype(str))
+            except Exception as e:
+                st.warning(f"Error reading taxonomy file {getattr(f, 'name', '')}: {e}")
 
-            # Fill Taxonomy
-            mask_tax = pd.Series(False, index=df_main.index)
-            for tax_df in tax_dfs:
-                if id_col in tax_df.columns:
-                    mask_tax = mask_tax | df_main[id_col].isin(tax_df[id_col])
-                else:
-                    st.warning(f"Column '{id_col}' not found in one of the taxonomy mapping files.")
-            df_main.loc[mask_tax, taxonomy_col] = df_main.loc[mask_tax, id_col]
+        # Mark matches in Taxonomy column
+        df_main[taxonomy_col] = df_main[id_col].astype(str).where(
+            df_main[id_col].astype(str).isin(taxonomy_ids),
+            ""
+        )
 
-            # Fill PAI
-            if id_col in df_pai_map.columns:
-                mask_pai = df_main[id_col].isin(df_pai_map[id_col])
-                df_main.loc[mask_pai, pai_col] = df_main.loc[mask_pai, id_col]
-            else:
-                st.warning(f"Column '{id_col}' not found in PAI mapping file.")
-
-            # Fill ESG
-            if id_col in df_esg_map.columns:
-                mask_esg = df_main[id_col].isin(df_esg_map[id_col])
-                df_main.loc[mask_esg, esg_col] = df_main.loc[mask_esg, id_col]
-            else:
-                st.warning(f"Column '{id_col}' not found in ESG mapping file.")
-
-            # Prepare for download
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_main.to_excel(writer, index=False)
-            output.seek(0)
-
-            st.download_button(
-                label="Download Filled Excel",
-                data=output,
-                file_name="EquityRef_ESGdataMap_filled.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        # --- PAI mapping ---
+        try:
+            df_pai = pd.read_excel(pai_file, usecols=['KeyInstn'])
+            pai_ids = set(df_pai['KeyInstn'].dropna().astype(str))
+            df_main[pai_col] = df_main[id_col].astype(str).where(
+                df_main[id_col].astype(str).isin(pai_ids),
+                ""
             )
+        except Exception as e:
+            st.warning(f"Error reading PAI file: {e}")
+
+        # --- ESG mapping ---
+        try:
+            # Header row is in row 5 (0-indexed 4), data from row 8 onward
+            df_esg = pd.read_excel(esg_file, header=4, usecols=['SP_ENTITY_ID'])
+            esg_ids = set(df_esg['SP_ENTITY_ID'].dropna().astype(str))
+            df_main[esg_col] = df_main[id_col].astype(str).where(
+                df_main[id_col].astype(str).isin(esg_ids),
+                ""
+            )
+        except Exception as e:
+            st.warning(f"Error reading ESG file: {e}")
+
+        # Export to Excel for download
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_main.to_excel(writer, index=False)
+        output.seek(0)
+
+        st.download_button(
+            label="Download Filled Excel",
+            data=output,
+            file_name="EquityRef_ESGdataMap_filled.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+if __name__ == "__main__":
+    main()
