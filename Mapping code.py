@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 """Streamlit app to map ESG / PAI / Taxonomy IDs.
-   v2025‑05‑15 – Added logic to treat the literal strings
-   "NA", "N/A", and "na" as missing and ONLY overwrite empty/NA cells.
+
+v2025‑05‑15‑b – Keeps literal "NA" / "N/A" strings.
+Only replaces cells *currently* placeholder (blank, NaN, "NA", "N/A")
+when a matching ID is found. Other existing values remain untouched.
 """
 
 import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-NA_STRINGS = ["NA", "N/A", "na", "Na", "n/a"]
+# Placeholder strings the user wants preserved unless overwritten
+PLACEHOLDERS = {"", "NA", "N/A", "na", "n/a", "Na"}
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helper utilities
 # ────────────────────────────────────────────────────────────────────────────────
 
 def read_id_column(file, col_name: str, header: int | None = 0):
-    """Read a single ID column as Int64 Series, stripping NA‑like strings."""
-    df = pd.read_excel(file, header=header, dtype={col_name: str})
+    """Read *col_name* from *file* and return an Int64 Series of IDs."""
+    df = pd.read_excel(file, header=header, dtype=str)
     df.columns = df.columns.str.strip()
     if col_name not in df.columns:
         raise ValueError(f"Column '{col_name}' not found in {getattr(file,'name',file)}")
-    ser = df[col_name].replace(NA_STRINGS, pd.NA).dropna()
-    return pd.to_numeric(ser, errors="coerce").dropna().astype("Int64")
+    series = pd.to_numeric(df[col_name], errors="coerce").dropna().astype("Int64")
+    return series
 
 
-def ids_series(df: pd.DataFrame, column: str) -> pd.Series:
-    """Return df[column] coerced to Int64, treating NA strings as missing."""
-    ser = df[column].replace(NA_STRINGS, pd.NA)
-    return pd.to_numeric(ser, errors="coerce").astype("Int64")
+def numeric_ids(series: pd.Series) -> pd.Series:
+    """Convert a Series to Int64, coercing errors to NaNs (keeps original object dtype)."""
+    return pd.to_numeric(series, errors="coerce").astype("Int64")
+
+
+def placeholder_mask(series: pd.Series) -> pd.Series:
+    """True where the cell is NaN, blank, or one of the placeholder strings."""
+    return (
+        series.isna()
+        | series.astype(str).str.strip().isin(PLACEHOLDERS)
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -36,7 +46,7 @@ def ids_series(df: pd.DataFrame, column: str) -> pd.Series:
 
 def main():
     st.set_page_config(page_title="EquityRef ESG Data Mapper", layout="wide")
-    st.title("EquityRef ESG Data Mapper (v2025‑05‑15)")
+    st.title("EquityRef ESG Data Mapper (keeps NA placeholders)")
 
     equity_file = st.file_uploader("Main file: EquityRef_ESGdataMap", type=["xlsx", "xls"])
     taxonomy_files = st.file_uploader(
@@ -50,22 +60,21 @@ def main():
             st.error("Please upload all required files.")
             return
 
-        # Read main file – treat NA-like strings as NaNs right away
-        df_main = pd.read_excel(equity_file, dtype=str, na_values=NA_STRINGS)
+        # Read main file WITHOUT auto‑converting 'NA' to NaN
+        df_main = pd.read_excel(equity_file, dtype=str)
         id_col, tax_col, pai_col, esg_col = "Ids", "Taxonomy", "PAI", "ESG"
 
         if id_col not in df_main.columns:
             st.error(f"Column '{id_col}' not found in main file.")
             return
 
-        df_main[id_col] = ids_series(df_main, id_col)
+        # Convert Ids to Int64 for matching but keep original str dtype for export
+        df_main[id_col + "_num"] = numeric_ids(df_main[id_col])
 
-        # Make sure target columns exist & normalised
+        # Ensure target columns exist
         for col in (tax_col, pai_col, esg_col):
             if col not in df_main.columns:
-                df_main[col] = pd.Series([pd.NA] * len(df_main), dtype="Int64")
-            else:
-                df_main[col] = ids_series(df_main, col)
+                df_main[col] = "NA"  # default placeholder
 
         # ── Taxonomy mapping ────────────────────────────────────────────────
         taxonomy_ids_all = []
@@ -74,40 +83,52 @@ def main():
                 taxonomy_ids_all.append(read_id_column(f, "MI Key"))
             except Exception as e:
                 st.warning(str(e))
-        taxonomy_ids = set(pd.concat(taxonomy_ids_all).unique()) if taxonomy_ids_all else set()
-        mask_tax = df_main[id_col].isin(taxonomy_ids) & df_main[tax_col].isna()
+        taxonomy_set = set(pd.concat(taxonomy_ids_all).unique()) if taxonomy_ids_all else set()
+        mask_tax = (
+            df_main[id_col + "_num"].isin(taxonomy_set)
+            & placeholder_mask(df_main[tax_col])
+        )
         df_main.loc[mask_tax, tax_col] = df_main.loc[mask_tax, id_col]
 
         # ── PAI mapping ────────────────────────────────────────────────────
         try:
-            pai_ids = set(read_id_column(pai_file, "KeyInstn"))
-            mask_pai = df_main[id_col].isin(pai_ids) & df_main[pai_col].isna()
-            df_main.loc[mask_pai, pai_col] = df_main.loc[mask_pai, id_col]
+            pai_set = set(read_id_column(pai_file, "KeyInstn"))
         except Exception as e:
             st.warning(str(e))
-            mask_pai = pd.Series(False, index=df_main.index)
+            pai_set = set()
+        mask_pai = (
+            df_main[id_col + "_num"].isin(pai_set)
+            & placeholder_mask(df_main[pai_col])
+        )
+        df_main.loc[mask_pai, pai_col] = df_main.loc[mask_pai, id_col]
 
         # ── ESG mapping ────────────────────────────────────────────────────
         try:
-            esg_ids = set(read_id_column(esg_file, "SP_ENTITY_ID", header=4))
-            mask_esg = df_main[id_col].isin(esg_ids) & df_main[esg_col].isna()
-            df_main.loc[mask_esg, esg_col] = df_main.loc[mask_esg, id_col]
+            esg_set = set(read_id_column(esg_file, "SP_ENTITY_ID", header=4))
         except Exception as e:
             st.warning(str(e))
-            mask_esg = pd.Series(False, index=df_main.index)
+            esg_set = set()
+        mask_esg = (
+            df_main[id_col + "_num"].isin(esg_set)
+            & placeholder_mask(df_main[esg_col])
+        )
+        df_main.loc[mask_esg, esg_col] = df_main.loc[mask_esg, id_col]
 
         # Diagnostics
         st.success("Finished processing!")
         st.write(
             {
                 "Rows": len(df_main),
-                "Taxonomy filled": int(mask_tax.sum()),
-                "PAI filled": int(mask_pai.sum()),
-                "ESG filled": int(mask_esg.sum()),
+                "Taxonomy replaced": int(mask_tax.sum()),
+                "PAI replaced": int(mask_pai.sum()),
+                "ESG replaced": int(mask_esg.sum()),
             }
         )
 
-        # Export to Excel
+        # Clean‑up: drop helper numeric column
+        df_main.drop(columns=[id_col + "_num"], inplace=True)
+
+        # Export
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df_main.to_excel(writer, index=False)
